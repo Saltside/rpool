@@ -13,11 +13,12 @@ import (
 )
 
 var (
-	errPoolClosed  = errors.New("rpool: pool has been closed")
-	errCloseAgain  = errors.New("rpool: Pool.Close called more than once")
-	errWrongPool   = errors.New("rpool: provided resource was not acquired from this pool")
-	closedSentinel = sentinelCloser(1)
-	newSentinel    = sentinelCloser(2)
+	errAcquireTimeout = errors.New("rpool: timed out waiting to acquire resource")
+	errPoolClosed     = errors.New("rpool: pool has been closed")
+	errCloseAgain     = errors.New("rpool: Pool.Close called more than once")
+	errWrongPool      = errors.New("rpool: provided resource was not acquired from this pool")
+	closedSentinel    = sentinelCloser(1)
+	newSentinel       = sentinelCloser(2)
 )
 
 // Pool manages the life cycle of resources.
@@ -39,6 +40,9 @@ type Pool struct {
 	// resources are kept around when the idle cleanup kicks in.
 	MinIdle uint
 
+	// AcquireTimeout defines the duration of wait time to acquire a resource.
+	AcquireTimeout time.Duration
+
 	// IdleTimeout defines the duration of idle time after which a resource will
 	// be closed.
 	IdleTimeout time.Duration
@@ -52,7 +56,7 @@ type Pool struct {
 	Clock clock.Clock
 
 	manageOnce sync.Once
-	acquire    chan chan io.Closer
+	acquire    chan request
 	new        chan io.Closer
 	release    chan returnResource
 	discard    chan returnResource
@@ -63,9 +67,21 @@ type Pool struct {
 func (p *Pool) Acquire() (io.Closer, error) {
 	defer stats.BumpTime(p.Stats, "acquire.time").End()
 	p.manageOnce.Do(p.goManage)
-	r := make(chan io.Closer)
+
+	r := p.newRequest()
 	p.acquire <- r
-	c := <-r
+
+	var c io.Closer
+	select {
+	case c = <-r.resource:
+		r.timer.Stop()
+	case <-r.timer.C:
+		if !r.expired() {
+			panic("timer before expired, omg")
+		}
+		close(r.resource)
+		return nil, errAcquireTimeout
+	}
 
 	// sentinel value indicates the pool is closed
 	if c == closedSentinel {
@@ -142,7 +158,7 @@ func (p *Pool) goManage() {
 		panic("no close pool size configured")
 	}
 
-	p.acquire = make(chan chan io.Closer)
+	p.acquire = make(chan request)
 	p.new = make(chan io.Closer)
 	p.release = make(chan returnResource)
 	p.discard = make(chan returnResource)
@@ -153,6 +169,45 @@ func (p *Pool) goManage() {
 type entry struct {
 	resource io.Closer
 	use      time.Time
+}
+
+type request struct {
+	resource chan io.Closer
+
+	clock   clock.Clock
+	made    time.Time
+	timeout time.Duration
+	timer   *clock.Timer
+}
+
+func (r *request) expired() bool {
+	if r.timeout == 0 {
+		return false
+	}
+
+	expiresAt := r.made.Add(r.timeout)
+	return expiresAt.UnixNano() <= r.clock.Now().UnixNano()
+}
+
+func (p *Pool) newRequest() request {
+	klock := p.Clock
+	if klock == nil {
+		klock = clock.New()
+	}
+
+	r := request{
+		resource: make(chan io.Closer),
+		made:     klock.Now(),
+		clock:    klock,
+		timeout:  p.AcquireTimeout,
+		timer:    klock.Timer(p.AcquireTimeout),
+	}
+
+	if r.timeout == 0 {
+		r.timer.Stop()
+	}
+
+	return r
 }
 
 func (p *Pool) manage() {
@@ -194,6 +249,7 @@ func (p *Pool) manage() {
 	idleTicker := klock.Ticker(p.IdleTimeout)
 	closed := false
 	var closeResponse chan error
+manageloop:
 	for {
 		if closed && out == 0 && waiting.Len() == 0 {
 			if p.Stats != nil {
@@ -222,7 +278,7 @@ func (p *Pool) manage() {
 		case r := <-p.acquire:
 			// if closed, new acquire calls are rejected
 			if closed {
-				r <- closedSentinel
+				r.resource <- closedSentinel
 				stats.BumpSum(p.Stats, "acquire.error.closed", 1)
 				continue
 			}
@@ -231,7 +287,7 @@ func (p *Pool) manage() {
 			if cl := len(resources); cl > 0 {
 				c := resources[cl-1]
 				outResources[c.resource] = struct{}{}
-				r <- c.resource
+				r.resource <- c.resource
 				resources = resources[:cl-1]
 				out++
 				stats.BumpSum(p.Stats, "acquire.pool", 1)
@@ -249,7 +305,10 @@ func (p *Pool) manage() {
 			// newSentinel. We assume it's checked out. Acquire will discard if
 			// creating a new resource fails.
 			out++
-			r <- newSentinel
+			if r.expired() {
+				panic("doesn't want it")
+			}
+			r.resource <- newSentinel
 		case c := <-p.new:
 			outResources[c] = struct{}{}
 		case rr := <-p.release:
@@ -261,10 +320,17 @@ func (p *Pool) manage() {
 			close(rr.response)
 
 			// pass it to someone who's waiting
-			if e := waiting.Front(); e != nil {
-				r := waiting.Remove(e).(chan io.Closer)
-				r <- rr.resource
-				continue
+			for e := waiting.Front(); e != nil; e = e.Next() {
+				r := waiting.Remove(e).(request)
+
+				// Check if requester is still interested in
+				// the resource.
+				if r.expired() {
+					continue
+				}
+
+				r.resource <- rr.resource
+				continue manageloop
 			}
 
 			// no longer out
@@ -294,10 +360,17 @@ func (p *Pool) manage() {
 			// we can make a new one if someone is waiting. no need to decrement out
 			// in this case since we assume this new one is checked out. Acquire will
 			// discard if creating a new resource fails.
-			if e := waiting.Front(); e != nil {
-				r := waiting.Remove(e).(chan io.Closer)
-				r <- newSentinel
-				continue
+			for e := waiting.Front(); e != nil; e = e.Next() {
+				r := waiting.Remove(e).(request)
+
+				// Check if requester is still interested in
+				// the resource.
+				if r.expired() {
+					continue
+				}
+
+				r.resource <- newSentinel
+				continue manageloop
 			}
 
 			// otherwise we lost a resource and dont need a new one right away

@@ -4,14 +4,15 @@ import (
 	"errors"
 	"io"
 	"regexp"
+	"runtime"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/facebookgo/clock"
 	"github.com/facebookgo/ensure"
-	"github.com/facebookgo/rpool"
 	"github.com/facebookgo/stats"
+	"github.com/saltside/rpool"
 )
 
 var errWrongPool = errors.New("rpool: provided resource was not acquired from this pool")
@@ -438,6 +439,64 @@ func TestIdleClose(t *testing.T) {
 	ensure.Nil(t, p.Close())
 	ensure.DeepEqual(t, atomic.LoadInt32(&cm.newCount), int32(max))
 	ensure.DeepEqual(t, atomic.LoadInt32(&cm.closeCount), int32(max))
+}
+
+func TestAcquireTimeout(t *testing.T) {
+	t.Parallel()
+
+	klock := clock.NewMock()
+
+	var cm resourceMaker
+	p := rpool.Pool{
+		New:            cm.New,
+		Max:            1,
+		MinIdle:        1,
+		IdleTimeout:    time.Second,
+		AcquireTimeout: 30 * time.Second,
+		ClosePoolSize:  2,
+		Clock:          klock,
+	}
+
+	// Acquire the one resource to make the next acquire fail.
+	r, err := p.Acquire()
+	ensure.Nil(t, err)
+
+	acquireError := make(chan error)
+
+	go func() {
+		// Try to aquire yet another resource, but since none are available it
+		// should time out.
+		_, err = p.Acquire()
+		acquireError <- err
+	}()
+
+	runtime.Gosched()
+
+	// Advance past the timeout to trigger the timeout error.
+	klock.Add(time.Minute)
+
+	err = <-acquireError
+	ensure.Err(t, err, regexp.MustCompile("timed out"))
+
+	// Release the one resource so that it is available for the next
+	// acquire.
+	p.Release(r)
+
+	klock.Add(p.IdleTimeout)
+
+	go func() {
+		// Try to aquire yet another resource, but since none are available it
+		// should time out.
+		_, err = p.Acquire()
+		acquireError <- err
+	}()
+
+	runtime.Gosched()
+	klock.Add(time.Minute)
+
+	// Acquire the one resource to make sure that the acquire that timed
+	// out didn't get it.
+	ensure.Nil(t, <-acquireError)
 }
 
 func TestReleaseInvalid(t *testing.T) {
