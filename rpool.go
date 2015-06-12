@@ -13,10 +13,10 @@ import (
 )
 
 var (
-	errAcquireTimeout = errors.New("rpool: timed out waiting to acquire resource")
-	errPoolClosed     = errors.New("rpool: pool has been closed")
-	errCloseAgain     = errors.New("rpool: Pool.Close called more than once")
-	errWrongPool      = errors.New("rpool: provided resource was not acquired from this pool")
+	ErrAcquireTimeout = errors.New("rpool: timed out waiting to acquire resource")
+	ErrPoolClosed     = errors.New("rpool: pool has been closed")
+	ErrCloseAgain     = errors.New("rpool: Pool.Close called more than once")
+	ErrWrongPool      = errors.New("rpool: provided resource was not acquired from this pool")
 	closedSentinel    = sentinelCloser(1)
 	newSentinel       = sentinelCloser(2)
 )
@@ -80,12 +80,12 @@ func (p *Pool) Acquire() (io.Closer, error) {
 			panic("timer before expired, omg")
 		}
 		close(r.resource)
-		return nil, errAcquireTimeout
+		return nil, ErrAcquireTimeout
 	}
 
 	// sentinel value indicates the pool is closed
 	if c == closedSentinel {
-		return nil, errPoolClosed
+		return nil, ErrPoolClosed
 	}
 
 	// need to allocate a new resource
@@ -314,7 +314,7 @@ manageloop:
 		case rr := <-p.release:
 			// ensure we're dealing with a resource acquired thru us
 			if _, found := outResources[rr.resource]; !found {
-				rr.response <- errWrongPool
+				rr.response <- ErrWrongPool
 				return
 			}
 			close(rr.response)
@@ -349,7 +349,7 @@ manageloop:
 			// ensure we're dealing with a resource acquired thru us
 			if rr.resource != newSentinel { // this happens when new fails
 				if _, found := outResources[rr.resource]; !found {
-					rr.response <- errWrongPool
+					rr.response <- ErrWrongPool
 					return
 				}
 				close(rr.response)
@@ -409,7 +409,7 @@ manageloop:
 		case r := <-p.close:
 			// cant call close if already closing
 			if closed {
-				r <- errCloseAgain
+				r <- ErrCloseAgain
 				continue
 			}
 

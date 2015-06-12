@@ -501,7 +501,7 @@ func TestAcquireTimeout(t *testing.T) {
 
 func TestReleaseInvalid(t *testing.T) {
 	t.Parallel()
-	defer ensure.PanicDeepEqual(t, errWrongPool)
+	defer ensure.PanicDeepEqual(t, rpool.ErrWrongPool)
 	var cm resourceMaker
 	p := rpool.Pool{
 		New:           cm.New,
@@ -517,7 +517,7 @@ func TestReleaseInvalid(t *testing.T) {
 
 func TestDiscardInvalid(t *testing.T) {
 	t.Parallel()
-	defer ensure.PanicDeepEqual(t, errWrongPool)
+	defer ensure.PanicDeepEqual(t, rpool.ErrWrongPool)
 	var cm resourceMaker
 	p := rpool.Pool{
 		New:           cm.New,
