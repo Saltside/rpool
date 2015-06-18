@@ -76,6 +76,7 @@ func (p *Pool) Acquire() (io.Closer, error) {
 	case c = <-r.resource:
 		r.timer.Stop()
 	case <-r.timer.C:
+		stats.BumpSum(p.Stats, "acquire.error.timeout", 1)
 		close(r.resource)
 		return nil, ErrAcquireTimeout
 	}
