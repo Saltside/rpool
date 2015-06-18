@@ -76,9 +76,6 @@ func (p *Pool) Acquire() (io.Closer, error) {
 	case c = <-r.resource:
 		r.timer.Stop()
 	case <-r.timer.C:
-		if !r.expired() {
-			panic("timer before expired, omg")
-		}
 		close(r.resource)
 		return nil, ErrAcquireTimeout
 	}
